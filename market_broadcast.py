@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
 """
 市场播报 Agent (GitHub Actions 版)
-数据源: CryptoCompare (BTC) + Yahoo Finance v7 quote API (美股/港股)
+数据源:
+  - BTC AHR999: CryptoCompare
+  - 美股/港股:  Stooq CSV API (直接返回日涨跌幅,无需 key,云端 IP 友好)
 推送:  飞书自定义机器人 Webhook
+
+v3 变更:
+  - 抛弃 Yahoo Finance(v7 要 crumb 在 GitHub Actions 全部 401)
+  - 改用 Stooq /q/l 接口,字段 p 直接是日涨跌幅百分比
+  - 11 只股票一次 CSV 请求拿完
+注意:Stooq 数据延迟约 15 分钟,但 4 次/天的播报不敏感
 """
 import os, time, math, hmac, hashlib, base64, json
 from datetime import datetime, timezone, timedelta
 import urllib.request, urllib.error, urllib.parse
+import csv, io
 
 TZ_CST = timezone(timedelta(hours=8))
 now_cst = datetime.now(TZ_CST)
 TIME_STR = now_cst.strftime("%Y-%m-%d %H:%M")
 
 
-def fetch_json(url, timeout=20):
+def fetch_text(url, timeout=20):
     req = urllib.request.Request(
         url,
         headers={
@@ -22,12 +31,15 @@ def fetch_json(url, timeout=20):
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
-            "Accept": "application/json, */*",
-            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "*/*",
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+        return r.read().decode("utf-8", errors="replace")
+
+
+def fetch_json(url, timeout=20):
+    return json.loads(fetch_text(url, timeout))
 
 
 # ── 1. BTC AHR999 ─────────────────────────────────────────────────────────────
@@ -66,30 +78,46 @@ def get_ahr999():
         return "N/A", "N/A", ""
 
 
-# ── 2. Yahoo v7 quote 批量获取 ────────────────────────────────────────────────
-def get_quotes_batch(symbols):
+# ── 2. Stooq CSV 批量获取 ─────────────────────────────────────────────────────
+def get_quotes_batch(stooq_symbols):
     """
-    一次请求拿多只股票的实时报价。
-    Yahoo v7 quote 接口直接返回:
-      regularMarketPrice          - 当前价
-      regularMarketChangePercent  - 日涨跌幅(就是它,不用自己算)
-      regularMarketPreviousClose  - 真正的昨收
-    返回 dict: {symbol: {"price": float, "pct": float}}
-    任一 symbol 拉取失败,该 key 不在返回 dict 中。
+    stooq_symbols: list of stooq symbols, e.g. ["aapl.us", "0700.hk"]
+    Stooq /q/l 接口字段 f=sd2t2ohlcp:
+      s   = symbol
+      d2  = date
+      t2  = time
+      o   = open
+      h   = high
+      l   = low
+      c   = close (当前价)
+      p   = percent change (日涨跌幅,带百分号或纯数字)
+    返回 dict: {symbol_lower: {"price": float, "pct": float}}
     """
     try:
         url = (
-            "https://query1.finance.yahoo.com/v7/finance/quote?"
-            + urllib.parse.urlencode({"symbols": ",".join(symbols)})
+            "https://stooq.com/q/l/?"
+            + urllib.parse.urlencode({
+                "s": ",".join(stooq_symbols),
+                "f": "sd2t2ohlcp",
+                "h": "",
+                "e": "csv",
+            })
         )
-        data = fetch_json(url)
+        text = fetch_text(url)
         result = {}
-        for q in data.get("quoteResponse", {}).get("result", []):
-            sym = q.get("symbol")
-            price = q.get("regularMarketPrice")
-            pct = q.get("regularMarketChangePercent")
-            if sym and price is not None and pct is not None:
+        reader = csv.DictReader(io.StringIO(text))
+        for row in reader:
+            sym = (row.get("Symbol") or "").lower()
+            close_str = row.get("Close")
+            pct_str = (row.get("Percent") or "").strip().rstrip("%")
+            if not sym or not close_str or close_str == "N/D":
+                continue
+            try:
+                price = float(close_str)
+                pct = float(pct_str) if pct_str and pct_str != "N/D" else 0.0
                 result[sym] = {"price": price, "pct": pct}
+            except ValueError:
+                continue
         return result
     except Exception as e:
         print(f"[batch quote] 拉取失败: {e}")
@@ -97,32 +125,42 @@ def get_quotes_batch(symbols):
 
 
 # ── 3. 美股七巨头 ─────────────────────────────────────────────────────────────
-US_STOCKS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA"]
+# (display_symbol, stooq_symbol)
+US_STOCKS = [
+    ("AAPL",  "aapl.us"),
+    ("MSFT",  "msft.us"),
+    ("GOOGL", "googl.us"),
+    ("AMZN",  "amzn.us"),
+    ("META",  "meta.us"),
+    ("NVDA",  "nvda.us"),
+    ("TSLA",  "tsla.us"),
+]
 
 def build_us_lines(quotes):
     lines = []
-    for sym in US_STOCKS:
-        q = quotes.get(sym)
+    for display, stooq in US_STOCKS:
+        q = quotes.get(stooq)
         if q is None:
-            lines.append(f"{sym:<6} N/A")
+            lines.append(f"{display:<6} N/A")
         else:
             sign = "+" if q["pct"] >= 0 else ""
-            lines.append(f"{sym:<6} ${q['price']:<10.2f} {sign}{q['pct']:.2f}%")
+            lines.append(f"{display:<6} ${q['price']:<10.2f} {sign}{q['pct']:.2f}%")
     return lines
 
 
 # ── 4. 港股四只 ───────────────────────────────────────────────────────────────
+# (name, code, stooq_symbol)
 HK_STOCKS = [
-    ("0700.HK", "腾讯", "0700"),
-    ("9988.HK", "阿里", "9988"),
-    ("3690.HK", "美团", "3690"),
-    ("1810.HK", "小米", "1810"),
+    ("腾讯", "0700", "0700.hk"),
+    ("阿里", "9988", "9988.hk"),
+    ("美团", "3690", "3690.hk"),
+    ("小米", "1810", "1810.hk"),
 ]
 
 def build_hk_lines(quotes):
     lines = []
-    for sym_full, name, code in HK_STOCKS:
-        q = quotes.get(sym_full)
+    for name, code, stooq in HK_STOCKS:
+        q = quotes.get(stooq)
         if q is None:
             lines.append(f"{name}  {code}   N/A")
         else:
@@ -135,9 +173,8 @@ def build_hk_lines(quotes):
 def build_message():
     btc_price, ahr999, signal = get_ahr999()
 
-    # 11 只股票一次请求拿完
-    all_symbols = US_STOCKS + [s[0] for s in HK_STOCKS]
-    quotes = get_quotes_batch(all_symbols)
+    all_stooq = [s for _, s in US_STOCKS] + [s for _, _, s in HK_STOCKS]
+    quotes = get_quotes_batch(all_stooq)
 
     return "\n".join([
         "📊 多市场监控",
