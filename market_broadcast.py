@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-市场播报 Agent
-数据源: CryptoCompare (BTC) + Yahoo Finance (美股/港股)
+市场播报 Agent (GitHub Actions 版)
+数据源: CryptoCompare (BTC) + Yahoo Finance v7 quote API (美股/港股)
 推送:  飞书自定义机器人 Webhook
 """
 import os, time, math, hmac, hashlib, base64, json
 from datetime import datetime, timezone, timedelta
-import urllib.request, urllib.error
+import urllib.request, urllib.error, urllib.parse
 
 TZ_CST = timezone(timedelta(hours=8))
 now_cst = datetime.now(TZ_CST)
@@ -23,6 +23,7 @@ def fetch_json(url, timeout=20):
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
             "Accept": "application/json, */*",
+            "Accept-Language": "en-US,en;q=0.9",
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -65,63 +66,79 @@ def get_ahr999():
         return "N/A", "N/A", ""
 
 
-# ── 2. Yahoo Finance 通用 ──────────────────────────────────────────────────────
-def get_yahoo(symbol):
+# ── 2. Yahoo v7 quote 批量获取 ────────────────────────────────────────────────
+def get_quotes_batch(symbols):
+    """
+    一次请求拿多只股票的实时报价。
+    Yahoo v7 quote 接口直接返回:
+      regularMarketPrice          - 当前价
+      regularMarketChangePercent  - 日涨跌幅(就是它,不用自己算)
+      regularMarketPreviousClose  - 真正的昨收
+    返回 dict: {symbol: {"price": float, "pct": float}}
+    任一 symbol 拉取失败,该 key 不在返回 dict 中。
+    """
     try:
-        data = fetch_json(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/"
-            f"{symbol}?interval=1d&range=2d"
+        url = (
+            "https://query1.finance.yahoo.com/v7/finance/quote?"
+            + urllib.parse.urlencode({"symbols": ",".join(symbols)})
         )
-        meta = data["chart"]["result"][0]["meta"]
-        price = meta.get("regularMarketPrice")
-        prev  = meta.get("chartPreviousClose")
-        if price is None or prev is None or prev == 0:
-            raise ValueError("price/prev 为空")
-        return price, (price - prev) / prev * 100
+        data = fetch_json(url)
+        result = {}
+        for q in data.get("quoteResponse", {}).get("result", []):
+            sym = q.get("symbol")
+            price = q.get("regularMarketPrice")
+            pct = q.get("regularMarketChangePercent")
+            if sym and price is not None and pct is not None:
+                result[sym] = {"price": price, "pct": pct}
+        return result
     except Exception as e:
-        print(f"[{symbol}] 拉取失败: {e}")
-        return None, None
+        print(f"[batch quote] 拉取失败: {e}")
+        return {}
 
 
 # ── 3. 美股七巨头 ─────────────────────────────────────────────────────────────
 US_STOCKS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA"]
 
-def build_us_lines():
+def build_us_lines(quotes):
     lines = []
     for sym in US_STOCKS:
-        price, pct = get_yahoo(sym)
-        if price is None:
+        q = quotes.get(sym)
+        if q is None:
             lines.append(f"{sym:<6} N/A")
         else:
-            sign = "+" if pct >= 0 else ""
-            lines.append(f"{sym:<6} ${price:<10.2f} {sign}{pct:.2f}%")
+            sign = "+" if q["pct"] >= 0 else ""
+            lines.append(f"{sym:<6} ${q['price']:<10.2f} {sign}{q['pct']:.2f}%")
     return lines
 
 
-# ── 4. 港股五只 ───────────────────────────────────────────────────────────────
+# ── 4. 港股四只 ───────────────────────────────────────────────────────────────
 HK_STOCKS = [
-    ("0700.HK", "腾讯",   "0700"),
-    ("9988.HK", "阿里",   "9988"),
-    ("3690.HK", "美团",   "3690"),
-    ("1810.HK", "小米",   "1810"),
-    ("1211.HK", "比亚迪", "1211"),
+    ("0700.HK", "腾讯", "0700"),
+    ("9988.HK", "阿里", "9988"),
+    ("3690.HK", "美团", "3690"),
+    ("1810.HK", "小米", "1810"),
 ]
 
-def build_hk_lines():
+def build_hk_lines(quotes):
     lines = []
     for sym_full, name, code in HK_STOCKS:
-        price, pct = get_yahoo(sym_full)
-        if price is None:
+        q = quotes.get(sym_full)
+        if q is None:
             lines.append(f"{name}  {code}   N/A")
         else:
-            sign = "+" if pct >= 0 else ""
-            lines.append(f"{name}  {code}   ${price:<10.2f} {sign}{pct:.2f}%")
+            sign = "+" if q["pct"] >= 0 else ""
+            lines.append(f"{name}  {code}   ${q['price']:<10.2f} {sign}{q['pct']:.2f}%")
     return lines
 
 
 # ── 5. 拼装消息 ───────────────────────────────────────────────────────────────
 def build_message():
     btc_price, ahr999, signal = get_ahr999()
+
+    # 11 只股票一次请求拿完
+    all_symbols = US_STOCKS + [s[0] for s in HK_STOCKS]
+    quotes = get_quotes_batch(all_symbols)
+
     return "\n".join([
         "📊 多市场监控",
         f"<北京时间 {TIME_STR}>",
@@ -131,10 +148,10 @@ def build_message():
         f"AHR999: {ahr999} {signal}",
         "",
         "━━━ 美股七巨头 (USD) ━━━",
-        *build_us_lines(),
+        *build_us_lines(quotes),
         "",
         "━━━ 港股 (HKD) ━━━",
-        *build_hk_lines(),
+        *build_hk_lines(quotes),
     ])
 
 
