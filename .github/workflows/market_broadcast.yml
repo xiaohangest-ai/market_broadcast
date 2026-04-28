@@ -2,16 +2,16 @@ name: 市场播报
 
 on:
   schedule:
-    # 港股开盘后 北京时间 09:35（UTC 01:35）周一至周五
     - cron: '35 1 * * 1-5'
-    # 美股收盘后 北京时间次日凌晨 05:00（UTC 前一天 21:00）周一至周五
     - cron: '0 21 * * 1-5'
-  workflow_dispatch:   # 手动触发按钮
+  workflow_dispatch:
 
 jobs:
   broadcast:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: write        # 允许 push
 
     steps:
       - name: Checkout
@@ -27,3 +27,12 @@ jobs:
           LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
           LARK_SIGN_SECRET: ${{ secrets.LARK_SIGN_SECRET }}
         run: python market_broadcast.py
+
+      - name: Keep repo active
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          echo "Last run: $(date -u '+%Y-%m-%d %H:%M UTC')" > last_run.txt
+          git add last_run.txt
+          git commit -m "chore: keep alive" || echo "no changes"
+          git push
